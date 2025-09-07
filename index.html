@@ -72,6 +72,7 @@
 
   // ----- Binary PCM audio -----
   if (ev.data instanceof ArrayBuffer) {
+    console.log("🎵 Binary audio frame received:", ev.data.byteLength, "bytes");
     const pcm16 = new Int16Array(ev.data);
     const float32 = new Float32Array(pcm16.length);
 
@@ -126,4 +127,5 @@
   </script>
 </body>
 </html>
+
 
