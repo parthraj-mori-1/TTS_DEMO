@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PCM Live Stream Player with Chat</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, "Segoe UI", Arial; padding: 24px; max-width: 900px; }
+    label, input, button, textarea { margin:8px 0; }
+    input[type=text] { padding:8px; width:100%; }
+    button { padding:8px 12px; }
+    .row { display:flex; gap:8px; align-items:center; margin: 12px 0; }
+    pre { background:#f4f4f6; padding:12px; border-radius:6px; overflow:auto; }
+    #chat { border:1px solid #ccc; border-radius:6px; padding:12px; margin-top:12px; height:200px; overflow-y:auto; }
+    .msg { margin:4px 0; }
+    .msg.user { color:#0077cc; }
+    .msg.server { color:#444; }
+  </style>
+</head>
+<body>
+  <h1>PCM Live Stream Player with Chat</h1>
+
+  <label for="wsUrl">WebSocket URL (wss://...)</label>
+  <input id="wsUrl" type="text" value="wss://example.com/stream" />
+
+  <div class="row">
+    <button id="startBtn">Start Audio Stream</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <label><input id="useFallback" type="checkbox" /> Force ScriptProcessorNode fallback</label>
+
+  <h3>Status</h3>
+  <pre id="status">idle</pre>
+
+  <h3>Chat</h3>
+  <div id="chat"></div>
+  <div class="row">
+    <input id="chatInput" type="text" placeholder="Type message..." />
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <script>
+  // ----- AudioWorklet processor code as a JS module string -----
+  const processorCode = `
+  class PCMPlayerProcessor extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.queue = [];
+      this.readChunk = null;
+      this.readIndex = 0;
+
+      this.port.onmessage = (event) => {
+        const data = event.data;
+        if (!data) return;
+        if (data.samples) {
+          const samples = data.samples instanceof Float32Array ? data.samples : new Float32Array(data.samples);
+          this.queue.push(samples);
+        }
+        if (data.clear) {
+          this.queue = [];
+          this.readChunk = null;
+          this.readIndex = 0;
+        }
+      };
+    }
+
+    process(inputs, outputs) {
+      const output = outputs[0];
+      const channel = output[0];
+
+      for (let i = 0; i < channel.length; i++) {
+        if (this.readChunk && this.readIndex < this.readChunk.length) {
+          channel[i] = this.readChunk[this.readIndex++];
+        } else {
+          if (this.queue.length > 0) {
+            this.readChunk = this.queue.shift();
+            this.readIndex = 0;
+            channel[i] = this.readChunk[this.readIndex++];
+          } else {
+            channel[i] = 0.0;
+          }
+        }
+      }
+      return true;
+    }
+  }
+  registerProcessor('pcm-player-processor', PCMPlayerProcessor);
+  `;
+
+  // UI elements
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const chatDiv = document.getElementById('chat');
+  const chatInput = document.getElementById('chatInput');
+  const sendBtn = document.getElementById('sendBtn');
+  const wsUrlInput = document.getElementById('wsUrl');
+  const useFallbackCheckbox = document.getElementById('useFallback');
+
+  let audioCtx = null;
+  let workletNode = null;
+  let scriptNode = null;
+  let ws = null;
+  let playbackSampleRate = 16000;
+
+  function logStatus(...args) {
+    const msg = args.join(' ');
+    statusEl.textContent = msg;
+    console.log(msg);
+  }
+
+  function appendMessage(text, who) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + who;
+    div.textContent = text;
+    chatDiv.appendChild(div);
+    chatDiv.scrollTop = chatDiv.scrollHeight;
+  }
+
+  async function initAudioWorklet() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: playbackSampleRate });
+    const blob = new Blob([processorCode], { type: 'application/javascript' });
+    const moduleURL = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(moduleURL);
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-player-processor');
+    workletNode.connect(audioCtx.destination);
+    URL.revokeObjectURL(moduleURL);
+  }
+
+  async function startStreaming() {
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    const wsUrl = wsUrlInput.value.trim();
+    try {
+      if (!useFallbackCheckbox.checked && typeof AudioWorkletNode !== 'undefined') {
+        await initAudioWorklet();
+      } else {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: playbackSampleRate });
+      }
+      await audioCtx.resume();
+
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => logStatus('WebSocket open');
+      ws.onclose = () => logStatus('WebSocket closed');
+      ws.onerror = (e) => logStatus('WebSocket error', e);
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          appendMessage(ev.data, 'server');
+          return;
+        }
+        const pcm16 = new Int16Array(ev.data);
+        const float32 = new Float32Array(pcm16.length);
+        for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
+        if (workletNode) workletNode.port.postMessage({ samples: float32 });
+      };
+    } catch (err) {
+      logStatus('startStreaming error: ' + err);
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+  }
+
+  function stopStreaming() {
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    if (workletNode) { try { workletNode.port.postMessage({ clear: true }); } catch (e) {} workletNode = null; }
+    if (scriptNode) { scriptNode = null; }
+  }
+
+  function sendMessage() {
+    const msg = chatInput.value.trim();
+    if (!msg || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const payload = { action: 'sendMessage', message: msg };
+    ws.send(JSON.stringify(payload));
+    appendMessage(msg, 'user');
+    chatInput.value = '';
+  }
+
+  startBtn.addEventListener('click', startStreaming);
+  stopBtn.addEventListener('click', stopStreaming);
+  sendBtn.addEventListener('click', sendMessage);
+  chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+  </script>
+</body>
+</html>
